@@ -59,6 +59,22 @@ def generate_bio_code():
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "TFF-" + "".join(random.choice(chars) for _ in range(6))
 
+def seed_initial_tasks(c, admin_id):
+    existing = c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    if existing > 0:
+        return
+    sample_tasks = [
+        (admin_id, "instagram", "Instagram sahifaga obuna bo'ling (TopFollowFaster)", "https://www.instagram.com/instagram/", 100),
+        (admin_id, "youtube", "YouTube kanalga obuna bo'ling", "https://www.youtube.com/", 100),
+        (admin_id, "telegram_channel", "Telegram yangiliklar kanaliga a'zo bo'ling", "https://t.me/telegram", 100),
+        (admin_id, "telegram_group", "Telegram muhokama guruhiga qo'shiling", "https://t.me/telegram", 100),
+    ]
+    for owner_id, platform, title, link, target_count in sample_tasks:
+        c.execute("""
+            INSERT INTO tasks (owner_id, platform, title, link, target_count, price_per_action, reward_per_action, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+        """, (owner_id, platform, title, link, target_count, CONFIG["ADVERTISER_PRICE"], CONFIG["WORKER_REWARD"]))
+
 def init_db():
     conn = get_db()
     c = conn.cursor()
@@ -152,7 +168,6 @@ def init_db():
         if col not in tx_cols:
             c.execute(ddl)
 
-    # Har bir foydalanuvchiga bio kod tayinlash
     rows = c.execute("SELECT id, ig_bio_code FROM users").fetchall()
     for r in rows:
         if not r["ig_bio_code"]:
@@ -160,14 +175,18 @@ def init_db():
 
     admin = c.execute("SELECT id FROM users WHERE username = ?", (CONFIG["ADMIN_USER"],)).fetchone()
     if not admin:
-        c.execute("""
+        cur = c.execute("""
             INSERT INTO users (username, email, password_hash, ig_bio_code, ad_balance, is_admin)
             VALUES (?, ?, ?, ?, ?, 1)
         """, (CONFIG["ADMIN_USER"], CONFIG["ADMIN_EMAIL"], generate_password_hash(CONFIG["ADMIN_PASS"]), generate_bio_code(), 10000))
+        admin_id = cur.lastrowid
     else:
+        admin_id = admin["id"]
         c.execute("""
             UPDATE users SET email = ?, is_admin = 1 WHERE username = ?
         """, (CONFIG["ADMIN_EMAIL"], CONFIG["ADMIN_USER"]))
+
+    seed_initial_tasks(c, admin_id)
 
     conn.commit()
     conn.close()
@@ -204,13 +223,27 @@ def send_reset_email(to_email, code):
     msg["From"] = smtp_email
     msg["To"] = to_email
 
+    last_err = ""
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(smtp_email, smtp_pass)
+            server.sendmail(smtp_email, [to_email], msg.as_string())
+        return True, "Kod emailga yuborildi!"
+    except Exception as e:
+        last_err = str(e)
+
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
             server.login(smtp_email, smtp_pass)
             server.sendmail(smtp_email, [to_email], msg.as_string())
         return True, "Kod emailga yuborildi!"
     except Exception as e:
-        return False, f"Email yuborishda xatolik: {e}"
+        last_err = str(e)
+
+    return False, f"Email yuborishda xatolik: {last_err}"
 
 def fetch_instagram_profile_info(ig_username):
     clean_user = ig_username.lstrip("@").strip().lower()
@@ -1164,7 +1197,7 @@ def profile(user):
             <form method="POST">
                 <input type="hidden" name="action" value="verify_bio">
                 <label>Sizning Instagram username'ingiz *</label>
-                <input type="text" name="ig_bio_username" value="{{ user.ig_nick.lstrip('@') }}" required placeholder="masalan: bahrom_01">
+                <input type="text" name="ig_bio_username" value="{{ user.ig_nick.lstrip('@') }}" required placeholder="masalan: bahromjonmaripjonov">
 
                 <button type="submit" class="btn btn-ig" style="width:100%;">Bio orqali akkauntni tanish va tasdiqlash</button>
             </form>
@@ -1315,7 +1348,6 @@ def verify_task(user, task_id):
         return redirect(url_for("earn"))
 
     if task["platform"] == "instagram":
-        # Bio kodni yana bir bor tasdiqlaymiz
         bio_ok, bio_msg = verify_ig_bio_code(user["ig_nick"], user["ig_bio_code"])
         if not bio_ok:
             conn.execute("UPDATE users SET ig_verified = 0 WHERE id = ?", (user["id"],))
