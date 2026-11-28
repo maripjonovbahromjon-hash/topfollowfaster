@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import timedelta
 from email.mime.text import MIMEText
 from functools import wraps
 from flask import Flask, request, session, redirect, url_for, render_template_string, flash, send_from_directory
@@ -17,6 +18,11 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "topfollowfaster_super_secret_key_2026")
+app.permanent_session_lifetime = timedelta(days=10)
+
+@app.before_request
+def make_session_permanent():
+    session.permanent = True
 
 RECEIPT_UPLOAD_DIR = os.path.join("static", "receipts")
 ALLOWED_RECEIPT_EXTS = {"png", "jpg", "jpeg", "webp", "pdf"}
@@ -101,6 +107,7 @@ def init_db():
             ig_bio_code TEXT DEFAULT '',
             ig_verified INTEGER DEFAULT 0,
             ig_sessionid TEXT DEFAULT '',
+            cookie_consent INTEGER DEFAULT 0,
             yt_nick TEXT DEFAULT '',
             tg_nick TEXT DEFAULT '',
             reset_code TEXT DEFAULT '',
@@ -174,6 +181,7 @@ def init_db():
         ("ig_bio_code", "ALTER TABLE users ADD COLUMN ig_bio_code TEXT DEFAULT ''"),
         ("ig_verified", "ALTER TABLE users ADD COLUMN ig_verified INTEGER DEFAULT 0"),
         ("ig_sessionid", "ALTER TABLE users ADD COLUMN ig_sessionid TEXT DEFAULT ''"),
+        ("cookie_consent", "ALTER TABLE users ADD COLUMN cookie_consent INTEGER DEFAULT 0"),
         ("reset_code", "ALTER TABLE users ADD COLUMN reset_code TEXT DEFAULT ''"),
         ("reset_expires", "ALTER TABLE users ADD COLUMN reset_expires INTEGER DEFAULT 0"),
     ]:
@@ -238,11 +246,19 @@ def parse_ig_link_or_nick(raw_value):
         parsed = urllib.parse.urlparse(val)
         parts = [p for p in parsed.path.split("/") if p]
         if parts and parts[0].lower() not in ("p", "reel", "reels", "stories", "explore"):
-            nick = parts[0].lstrip("@").strip()
+            nick = parts[0].lstrip("@").strip().lower()
             return nick, f"https://www.instagram.com/{nick}/"
         return "", val
-    nick = val.lstrip("@").strip()
+    nick = val.lstrip("@").strip().lower()
     return nick, f"https://www.instagram.com/{nick}/"
+
+def to_web_url(raw_url):
+    u = (raw_url or "").strip()
+    if not u:
+        return "#"
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    return "https://" + u.lstrip("/")
 
 # ================= GLOBAL XATO USHLAGICH =================
 @app.errorhandler(Exception)
@@ -342,70 +358,7 @@ def send_reset_email(to_email, code):
 
     return False, "Render Free tarifida SMTP portlar bloklangan. Render Environment'ga BREVO_API_KEY qo'shing."
 
-# ================= INSTAGRAM BIO + FOLLOW TEKSHIRUV =================
-def fetch_instagram_profile_info(ig_username):
-    clean_user = ig_username.lstrip("@").strip().lower()
-    if not clean_user:
-        return None
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-        "X-IG-App-ID": "936619743392459",
-        "Accept": "application/json, text/plain, */*",
-    }
-    try:
-        api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(clean_user)}"
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        u = (data.get("data") or {}).get("user")
-        if u:
-            return {
-                "username": u.get("username", clean_user),
-                "biography": u.get("biography", "") or "",
-                "is_private": bool(u.get("is_private", False)),
-            }
-    except Exception:
-        pass
-
-    try:
-        page_url = f"https://www.instagram.com/{urllib.parse.quote(clean_user)}/"
-        req = urllib.request.Request(page_url, headers={
-            "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        bio_match = re.search(r'"biography"\s*:\s*"((?:\\.|[^"\\])*)"', html)
-        if bio_match:
-            raw_bio = json.loads(f'"{bio_match.group(1)}"')
-            return {
-                "username": clean_user,
-                "biography": raw_bio,
-                "is_private": '"is_private":true' in html.lower(),
-            }
-        meta_match = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)["\']', html, re.I)
-        if meta_match:
-            return {
-                "username": clean_user,
-                "biography": urllib.parse.unescape(meta_match.group(1)),
-                "is_private": False,
-            }
-    except Exception:
-        pass
-    return None
-
-def verify_ig_bio_code(ig_username, expected_code):
-    clean_user = ig_username.lstrip("@").strip()
-    if not clean_user or not expected_code:
-        return False, "Instagram havola/username va kod kiriting!"
-    info = fetch_instagram_profile_info(clean_user)
-    if not info:
-        return False, "Instagram profilini o'qib bo'lmadi. Akkaunt ochiq (Public) ekanligini va havola/username to'g'riligini tekshiring."
-    bio_text = info.get("biography", "")
-    if expected_code.upper() in bio_text.upper():
-        return True, f"@{info['username']} akkaunti bio kodi ({expected_code}) orqali muvaffaqiyatli tasdiqlandi!"
-    return False, f"@{info['username']} profilining Bio qismida '{expected_code}' kodi topilmadi. Avval Instagram Bio'ga '{expected_code}' ni yozib saqlang."
-
+# ================= INSTAGRAM OBUNACHILAR RO'YXATIDAN QIDIRISH =================
 def extract_ig_username(link):
     parsed = urllib.parse.urlparse(link.strip())
     parts = [p for p in parsed.path.split("/") if p]
@@ -413,30 +366,87 @@ def extract_ig_username(link):
         return ""
     if parts[0].lower() in ("p", "reel", "reels", "stories", "explore"):
         return ""
-    return parts[0].lstrip("@").strip()
+    return parts[0].lstrip("@").strip().lower()
 
-def check_instagram_follow(sessionid, target_username):
-    if not sessionid or not target_username:
+def get_ig_user_profile_api(sessionid, username):
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(username)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36",
+            "X-IG-App-ID": "936619743392459",
+            "Cookie": f"sessionid={sessionid.strip()};",
+            "Accept": "application/json",
+        }
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return (data.get("data") or {}).get("user")
+
+def search_worker_in_target_followers(sessionid, target_username, worker_username):
+    """
+    Reklama bergan odamning (target_username) Instagram akkauntini topadi
+    va uning obunachilari (followers) ichidan bajaruvchining (worker_username)
+    akkauntini qidiradi.
+    Qaytadi:
+      True  -> obunachilar ichida topildi (yoki viewer obuna bo'lgani tasdiqlandi)
+      False -> aniq topilmadi / obuna bo'linmagan
+      None  -> Instagram vaqtinchalik chekladi yoki sessionid yaroqsiz
+    """
+    clean_target = (target_username or "").lstrip("@").strip().lower()
+    clean_worker = (worker_username or "").lstrip("@").strip().lower()
+    if not sessionid or not clean_target:
         return None
+
     try:
-        url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(target_username)}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36",
-                "X-IG-App-ID": "936619743392459",
-                "Cookie": f"sessionid={sessionid.strip()};",
-                "Accept": "application/json",
-            }
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        user_obj = data.get("data", {}).get("user", {})
-        if not user_obj:
+        target_user = get_ig_user_profile_api(sessionid, clean_target)
+        if not target_user:
             return None
-        return bool(user_obj.get("followed_by_viewer") or user_obj.get("requested_by_viewer"))
     except Exception:
         return None
+
+    target_id = str(target_user.get("id") or "")
+    followed_by_viewer = bool(target_user.get("followed_by_viewer") or target_user.get("requested_by_viewer"))
+
+    # 1-usul: Reklama beruvchining obunachilari (followers) ro'yxatidan worker_username ni qidirish
+    if target_id and clean_worker:
+        max_id = ""
+        for _ in range(5):  # 5 sahifagacha (~250 ta obunachi ichidan qidiradi)
+            q = f"https://www.instagram.com/api/v1/friendships/{urllib.parse.quote(target_id)}/followers/?count=50"
+            if max_id:
+                q += f"&max_id={urllib.parse.quote(str(max_id))}"
+            try:
+                req = urllib.request.Request(
+                    q,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36",
+                        "X-IG-App-ID": "936619743392459",
+                        "Cookie": f"sessionid={sessionid.strip()};",
+                        "Accept": "application/json",
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    fdata = json.loads(resp.read().decode("utf-8"))
+                users_list = fdata.get("users") or []
+                for u in users_list:
+                    uname = (u.get("username") or "").strip().lower()
+                    if uname == clean_worker:
+                        return True
+                if not fdata.get("big_list") or not fdata.get("next_max_id"):
+                    # Obunachilar ro'yxati oxirigacha tekshirildi va worker topilmadi
+                    return False if not followed_by_viewer else True
+                max_id = str(fdata.get("next_max_id"))
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    return None
+                break
+            except Exception:
+                break
+
+    # 2-usul: Agar followers ro'yxati cheklansa, viewer holatini tekshirish
+    if followed_by_viewer:
+        return True
+    return None
 
 # ================= YORDAMCHI FUNKSIYALAR =================
 def login_required(f):
@@ -667,19 +677,6 @@ BASE_HTML = """
         }
         .badge-ig { background: rgba(220, 39, 67, 0.18); color: #fda4af; }
         .badge-ok { background: rgba(16, 185, 129, 0.18); color: #6ee7b7; }
-        .code-chip {
-            display: inline-block;
-            background: #070b14;
-            border: 1px dashed #38bdf8;
-            color: #38bdf8;
-            font-family: monospace;
-            font-size: 17px;
-            font-weight: 800;
-            letter-spacing: 1.5px;
-            padding: 10px 16px;
-            border-radius: 10px;
-            margin: 8px 0 14px;
-        }
         .receipt-thumb {
             width: 84px;
             height: 84px;
@@ -715,6 +712,13 @@ BASE_HTML = """
             gap: 10px;
             flex-wrap: wrap;
         }
+        .consent-card {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.45);
+            border-radius: 14px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
     </style>
 </head>
 <body>
@@ -727,7 +731,7 @@ BASE_HTML = """
                 <a href="{{ url_for('advertise') }}">Buyurtma ({{ config.ADVERTISER_PRICE }} so'm)</a>
                 <a href="{{ url_for('wallet') }}">Hamyon</a>
                 <a href="{{ url_for('profile') }}" style="border:1px solid rgba(220,39,67,0.45); color:#fda4af;">
-                    Instagram & Silka
+                    Instagram & Cookie Ruxsati
                 </a>
                 {% if show_admin %}
                     <a href="{{ url_for('admin_panel') }}" style="background:rgba(234,88,12,0.25); color:#fdba74; border:1px solid rgba(234,88,12,0.5);">Admin</a>
@@ -765,6 +769,7 @@ def render_page(content_html, user=None, **kwargs):
         config=CONFIG,
         platforms=PLATFORMS,
         platform_dict=PLATFORM_DICT,
+        to_web_url=to_web_url,
         **kwargs
     )
     return render_template_string(BASE_HTML, content=inner, user=user, show_admin=show_admin, config=CONFIG)
@@ -915,7 +920,7 @@ def index():
         <div class="hero-pill">⚡ Tezkor SMM & Daromad Birjasi</div>
         <h1>{{ config.SITE_NAME }} — Haqiqiy Obunachilar va Kunlik Daromad</h1>
         <p style="color:#cbd5e1; max-width:650px; margin:0 auto 24px; font-size:15px;">
-            Instagram havolangizni ulang, shaxsiy tezkor silka yarating, vazifalarni bajarib har bir obuna uchun <b>{{ config.WORKER_REWARD }} so'm</b> ishlang yoki o'z sahifangizga <b>{{ config.ADVERTISER_PRICE }} so'm</b>dan obunachilar yig'ing!
+            Instagram silkangizni ulab, reklama bergan sahifaning obunachilari orasidan tekshiruvdan o'ting va har bir obuna uchun <b>{{ config.WORKER_REWARD }} so'm</b> ishlang yoki o'z sahifangizga <b>{{ config.ADVERTISER_PRICE }} so'm</b>dan obunachilar yig'ing!
         </p>
         <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
             <a href="{{ url_for('google_login') }}" class="btn btn-google">Google orqali kirish</a>
@@ -990,7 +995,7 @@ def register():
             conn.commit()
             session.pop("ref", None)
             session["user_id"] = cur.lastrowid
-            flash("Ro'yxatdan o'tdingiz! Endi Instagram havolasini ulab shaxsiy silka yarating.", "success")
+            flash("Ro'yxatdan o'tdingiz! Endi Instagram havolasini ulang va cookie tekshiruviga ruxsat bering.", "success")
             return redirect(url_for("profile"))
         except sqlite3.IntegrityError:
             flash("Ro'yxatdan o'tishda xatolik yuz berdi. Qayta urinib ko'ring.", "danger")
@@ -1001,7 +1006,7 @@ def register():
     <div class="card" style="max-width:440px; margin:0 auto;">
         <h2 style="margin-bottom:8px;">Tezkor ro'yxatdan o'tish</h2>
         <p style="font-size:13px; color:#94a3b8; margin-bottom:16px;">
-            Avval saytdan o'ting — keyin Instagram havolasini ulab, shaxsiy kirish silkangizni yaratishingiz mumkin.
+            Saytdan ro'yxatdan o'ting va akkauntingizni 10 kun davomida saqlab turing.
         </p>
         <a href="{{ url_for('google_login') }}" class="btn btn-google" style="width:100%; margin-bottom:16px;">Google OAuth orqali 1 bosishda kirish</a>
         <form method="POST">
@@ -1183,11 +1188,16 @@ def dashboard(user):
     html = """
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:16px;">
         <h2>Salom, {{ user.username }}! 👋</h2>
-        {% if user.ig_link %}
-            <a href="{{ user.ig_link }}" target="_blank" class="badge badge-ok">📸 Ulangan Instagram: {{ user.ig_nick or user.ig_link }}</a>
-        {% else %}
-            <a href="{{ url_for('profile') }}" class="btn btn-ig btn-sm">📸 Instagram havolasini ulash</a>
-        {% endif %}
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            {% if user.cookie_consent and user.ig_sessionid %}
+                <span class="badge badge-ok">🍪 Cookie ruxsat berilgan</span>
+            {% else %}
+                <a href="{{ url_for('profile') }}" class="btn btn-warning btn-sm">🍪 Cookie tekshiruviga ruxsat berish</a>
+            {% endif %}
+            {% if user.ig_link %}
+                <a href="{{ user.ig_link }}" target="_blank" class="badge badge-ok">📸 {{ user.ig_nick or user.ig_link }}</a>
+            {% endif %}
+        </div>
     </div>
 
     {% if recent_notifs %}
@@ -1216,10 +1226,7 @@ def dashboard(user):
     </div>
 
     <div class="card" style="margin-top:16px;">
-        <h3>🔗 Shaxsiy tezkor kirish silkangiz</h3>
-        <p style="font-size:13px; color:#cbd5e1; margin-top:4px;">
-            Shu silka orqali kirsangiz akkauntingizga tezkor kirasiz:
-        </p>
+        <h3>🔗 Shaxsiy tezkor kirish silkangiz (10 kunlik sessiya faol)</h3>
         <div class="ref-box">{{ quick_link }}</div>
 
         <h3 style="margin-top:16px;">🎁 Referal tizimi (Har bir do'st uchun +{{ config.REFERRAL_BONUS }} so'm)</h3>
@@ -1245,17 +1252,48 @@ def dashboard(user):
 @app.route("/profile", methods=["GET", "POST"])
 @login_required
 def profile(user):
-    bio_code = user["ig_bio_code"] or generate_bio_code()
     quick_token = user["quick_token"] or generate_quick_token()
     conn = get_db()
-    if not user["ig_bio_code"] or not user["quick_token"]:
-        conn.execute("UPDATE users SET ig_bio_code = ?, quick_token = ? WHERE id = ?", (bio_code, quick_token, user["id"]))
+    if not user["quick_token"]:
+        conn.execute("UPDATE users SET quick_token = ? WHERE id = ?", (quick_token, user["id"]))
         conn.commit()
 
     if request.method == "POST":
-        action = request.form.get("action", "save_ig_link")
+        action = request.form.get("action", "")
 
-        if action == "save_ig_link":
+        if action == "grant_cookie_consent":
+            ig_sessionid = request.form.get("ig_sessionid", "").strip()
+            raw_ig = request.form.get("ig_link_input", "").strip()
+            nick, full_link = parse_ig_link_or_nick(raw_ig)
+            if not nick:
+                conn.close()
+                flash("Obunachilar orasidan topilish uchun o'zingizning Instagram silkangiz yoki username'ingizni kiriting!", "danger")
+                return redirect(url_for("profile"))
+            if not ig_sessionid:
+                conn.close()
+                flash("Ruxsat berish uchun Instagram sessionid cookie qiymatini kiriting!", "danger")
+                return redirect(url_for("profile"))
+            formatted_nick = "@" + nick
+            conn.execute(
+                "UPDATE users SET cookie_consent = 1, ig_sessionid = ?, ig_link = ?, ig_nick = ?, ig_verified = 1 WHERE id = ?",
+                (ig_sessionid, full_link, formatted_nick, user["id"])
+            )
+            conn.commit()
+            conn.close()
+            flash(f"Ruxsat berildi! Tekshiruvda reklama beruvchi sahifasidan @{nick} qidiriladi.", "success")
+            return redirect(url_for("earn"))
+
+        elif action == "deny_cookie_consent":
+            conn.execute(
+                "UPDATE users SET cookie_consent = 0, ig_sessionid = '' WHERE id = ?",
+                (user["id"],)
+            )
+            conn.commit()
+            conn.close()
+            flash("Siz cookie tekshiruviga ruxsat bermadingiz (yoki bekor qildingiz). Instagram vazifalari tasdiqlanmaydi!", "danger")
+            return redirect(url_for("profile"))
+
+        elif action == "save_ig_link":
             raw_ig = request.form.get("ig_link_input", "").strip()
             nick, full_link = parse_ig_link_or_nick(raw_ig)
             if not full_link:
@@ -1264,7 +1302,7 @@ def profile(user):
                 return redirect(url_for("profile"))
             formatted_nick = ("@" + nick) if nick else ""
             conn.execute(
-                "UPDATE users SET ig_link = ?, ig_nick = ?, ig_verified = 1 WHERE id = ?",
+                "UPDATE users SET ig_link = ?, ig_nick = ? WHERE id = ?",
                 (full_link, formatted_nick, user["id"])
             )
             conn.commit()
@@ -1280,38 +1318,6 @@ def profile(user):
             flash("Yangi shaxsiy kirish silkasi yaratildi!", "info")
             return redirect(url_for("profile"))
 
-        elif action == "new_code":
-            new_code = generate_bio_code()
-            conn.execute("UPDATE users SET ig_bio_code = ?, ig_verified = 0 WHERE id = ?", (new_code, user["id"]))
-            conn.commit()
-            conn.close()
-            flash(f"Yangi Bio kodi yaratildi: {new_code}", "info")
-            return redirect(url_for("profile"))
-
-        elif action == "verify_bio":
-            ig_user = request.form.get("ig_bio_username", "").strip().lstrip("@")
-            nick, full_link = parse_ig_link_or_nick(ig_user)
-            if not nick:
-                conn.close()
-                flash("Instagram username yoki havola kiriting!", "danger")
-                return redirect(url_for("profile"))
-            formatted_nick = "@" + nick
-            ok, msg = verify_ig_bio_code(nick, bio_code)
-            if ok:
-                conn.execute(
-                    "UPDATE users SET ig_nick = ?, ig_link = ?, ig_verified = 1 WHERE id = ?",
-                    (formatted_nick, full_link, user["id"])
-                )
-                conn.commit()
-                conn.close()
-                flash(msg, "success")
-            else:
-                conn.execute("UPDATE users SET ig_nick = ?, ig_link = ? WHERE id = ?", (formatted_nick, full_link, user["id"]))
-                conn.commit()
-                conn.close()
-                flash(msg, "danger")
-            return redirect(url_for("profile"))
-
         elif action == "change_pass":
             new_pass = request.form.get("new_pass", "").strip()
             if len(new_pass) < 4:
@@ -1324,12 +1330,11 @@ def profile(user):
             return redirect(url_for("profile"))
 
         else:
-            ig_sessionid = request.form.get("ig_sessionid", "").strip()
             yt_nick = request.form.get("yt_nick", "").strip()
             tg_nick = request.form.get("tg_nick", "").strip()
             conn.execute(
-                "UPDATE users SET ig_sessionid=?, yt_nick=?, tg_nick=? WHERE id=?",
-                (ig_sessionid, yt_nick, tg_nick, user["id"])
+                "UPDATE users SET yt_nick=?, tg_nick=? WHERE id=?",
+                (yt_nick, tg_nick, user["id"])
             )
             conn.commit()
             conn.close()
@@ -1340,30 +1345,51 @@ def profile(user):
     quick_link = request.url_root.rstrip("/") + url_for("quick_link_login", token=quick_token)
 
     html = """
+    <div class="consent-card">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+            <h3>🍪 Cookie tekshiruvi va Obunachilar ichidan qidirish ruxsati</h3>
+            {% if user.cookie_consent and user.ig_sessionid %}
+                <span class="badge badge-ok">✅ Ruxsat berilgan</span>
+            {% else %}
+                <span class="badge badge-ig">⛔ Ruxsat berilmagan</span>
+            {% endif %}
+        </div>
+        <p style="font-size:13.5px; color:#e2e8f0; margin-bottom:14px;">
+            Siz o'z Instagram silkangizni kiritasiz. Reklama bergan odamning sahifasiga kirib obuna bosganingizdan so'ng, tizim reklama beruvchining <b>obunachilari orasidan sizning Instagram akkauntingizni</b> qidiradi.
+            <b>Cookie ruxsati bermasangiz, vazifa tasdiqlanmaydi.</b>
+        </p>
+
+        <form method="POST">
+            <input type="hidden" name="action" value="grant_cookie_consent">
+            <label>Sizning Instagram silkangiz (yoki username) *</label>
+            <input type="text" name="ig_link_input" value="{{ user.ig_link or user.ig_nick }}" required placeholder="https://www.instagram.com/sizning_nik/">
+
+            <label>Instagram Session ID cookie *</label>
+            <input type="text" name="ig_sessionid" value="{{ user.ig_sessionid }}" required placeholder="Instagram saytidagi sessionid cookie qiymati">
+
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <button type="submit" class="btn btn-success">✅ Ruxsat beraman va saqlayman</button>
+            </div>
+        </form>
+
+        <form method="POST" style="margin-top:10px;">
+            <input type="hidden" name="action" value="deny_cookie_consent">
+            <button type="submit" class="btn btn-danger btn-sm">❌ Ruxsat bermayman (cookie o'chirilsin)</button>
+        </form>
+    </div>
+
     <div class="grid-2">
         <div class="card">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:8px; flex-wrap:wrap;">
-                <h3>📸 Instagram Silkasi & Tezkor Kirish</h3>
-                {% if user.ig_link %}
-                    <span class="badge badge-ok">✅ Ulangan</span>
-                {% else %}
-                    <span class="badge badge-ig">Ulanmagan</span>
-                {% endif %}
-            </div>
-
+            <h3 style="margin-bottom:10px;">📸 Instagram Silkasi & Shaxsiy Kirish</h3>
             <form method="POST">
                 <input type="hidden" name="action" value="save_ig_link">
-                <label>Instagram silkasi (yoki username) *</label>
+                <label>Instagram silkasi</label>
                 <input type="text" name="ig_link_input" value="{{ user.ig_link or user.ig_nick }}" required placeholder="https://www.instagram.com/username/">
-                <button type="submit" class="btn btn-ig" style="width:100%;">Instagram silkasini ulash</button>
+                <button type="submit" class="btn btn-ig" style="width:100%;">Silkani saqlash</button>
             </form>
 
             <hr style="border-color:rgba(148,163,184,0.16); margin:18px 0;">
-
             <h4 style="margin-bottom:6px;">🔗 Shaxsiy kirish silkasi</h4>
-            <p style="font-size:12.5px; color:#94a3b8;">
-                Ushbu silkani saqlab qo'ying — bosganingizda akkauntingizga tezkor kirasiz:
-            </p>
             <div class="ref-box">{{ quick_link }}</div>
             <form method="POST" style="margin-top:10px;">
                 <input type="hidden" name="action" value="new_quick_link">
@@ -1372,15 +1398,9 @@ def profile(user):
         </div>
 
         <div class="card">
-            <h3 style="margin-bottom:10px;">⚙️ Bio tekshiruv va boshqa tarmoqlar</h3>
-            <p style="font-size:13px; color:#94a3b8; margin-bottom:10px;">
-                Agar <code>sessionid</code> kiritsangiz, obuna bosilganini API orqali tekshirishga urinadi.
-            </p>
+            <h3 style="margin-bottom:10px;">⚙️ YouTube & Telegram akkauntlari</h3>
             <form method="POST">
                 <input type="hidden" name="action" value="extras">
-                <label>Instagram Session ID (obunani tekshirish uchun)</label>
-                <input type="text" name="ig_sessionid" value="{{ user.ig_sessionid }}" placeholder="sessionid cookie qiymati">
-
                 <label>YouTube kanal / akkaunt</label>
                 <input type="text" name="yt_nick" value="{{ user.yt_nick }}" placeholder="@youtube_nik">
 
@@ -1391,27 +1411,17 @@ def profile(user):
             </form>
 
             <hr style="border-color:rgba(148,163,184,0.16); margin:18px 0;">
-            <div class="code-chip">{{ bio_code }}</div>
+            <h4 style="margin-bottom:10px;">🔑 Sayt parolini o'zgartirish</h4>
             <form method="POST">
-                <input type="hidden" name="action" value="verify_bio">
-                <label>Bio kodini tekshirish (username yoki havola)</label>
-                <input type="text" name="ig_bio_username" value="{{ user.ig_nick.lstrip('@') }}" placeholder="masalan: bahromjonmaripjonov">
-                <button type="submit" class="btn btn-warning btn-sm" style="width:100%;">Bio kodini tekshirish</button>
+                <input type="hidden" name="action" value="change_pass">
+                <label>Yangi parol</label>
+                <input type="password" name="new_pass" required placeholder="Kamida 4 ta belgi">
+                <button type="submit" class="btn btn-warning btn-sm">Parolni yangilash</button>
             </form>
         </div>
     </div>
-
-    <div class="card" style="max-width:480px;">
-        <h3 style="margin-bottom:10px;">🔑 Sayt parolini o'zgartirish</h3>
-        <form method="POST">
-            <input type="hidden" name="action" value="change_pass">
-            <label>Yangi parol</label>
-            <input type="password" name="new_pass" required placeholder="Kamida 4 ta belgi">
-            <button type="submit" class="btn btn-warning btn-sm">Parolni yangilash</button>
-        </form>
-    </div>
     """
-    return render_page(html, user=user, bio_code=bio_code, quick_link=quick_link)
+    return render_page(html, user=user, quick_link=quick_link)
 
 @app.route("/earn")
 @login_required
@@ -1437,6 +1447,16 @@ def earn(user):
     conn.close()
 
     html = """
+    {% if not (user.cookie_consent and user.ig_sessionid) %}
+    <div class="consent-card">
+        <h3>🍪 Diqqat: Cookie tekshiruvi ruxsati berilmagan!</h3>
+        <p style="font-size:13.5px; color:#e2e8f0; margin:6px 0 12px;">
+            Instagram vazifalarini tasdiqlash va reklama beruvchi obunachilari orasidan sizning akkauntingizni qidirish uchun cookie ruxsati bering. Ruxsat bermasangiz vazifa tasdiqlanmaydi.
+        </p>
+        <a href="{{ url_for('profile') }}" class="btn btn-warning btn-sm">🍪 Ruxsat berish sahifasiga o'tish</a>
+    </div>
+    {% endif %}
+
     {% if notifs %}
     <div class="card">
         <h3 style="margin-bottom:8px;">🔔 Yangi reklama zayavkalari</h3>
@@ -1457,8 +1477,8 @@ def earn(user):
             </div>
         </div>
         <p style="font-size:13.5px; color:#94a3b8; margin-top:10px;">
-            1. <b>"1. Saytga o'tish"</b> tugmasini bosing — sahifa ochiladi va havola belgilanadi.<br>
-            2. Sahifada <b>Obuna / Follow</b> bosing, saytga qayting va <b>"2. Tasdiqlash (+{{ config.WORKER_REWARD }} so'm)"</b> tugmasini bosing — mukofot balansingizga qo'shiladi.
+            1. <b>"1. Saytga o'tish"</b> tugmasini bosing — reklama beruvchining sahifasi ochiladi.<br>
+            2. Obuna bo'lib, saytga qayting va <b>"2. Tasdiqlash (+{{ config.WORKER_REWARD }} so'm)"</b> tugmasini bosing — reklama beruvchi obunachilari ichidan sizning akkauntingiz qidiriladi.
         </p>
     </div>
 
@@ -1472,7 +1492,7 @@ def earn(user):
                         <small style="color:#94a3b8;">Bajarildi: {{ t.completed_count }} / {{ t.target_count }}</small>
                     </div>
                     <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                        <a href="{{ t.link }}" target="_blank" onclick="markOpened({{ t.id }})" class="btn btn-primary btn-sm">1. Saytga o'tish ↗</a>
+                        <a href="{{ to_web_url(t.link) }}" target="_blank" rel="noopener noreferrer" onclick="markOpened({{ t.id }})" class="btn btn-primary btn-sm">1. Saytga o'tish ↗</a>
                         <form method="POST" action="{{ url_for('verify_task', task_id=t.id) }}" style="margin:0;">
                             <button type="submit" class="btn btn-success btn-sm">2. Tasdiqlash (+{{ t.reward_per_action }} so'm)</button>
                         </form>
@@ -1509,24 +1529,35 @@ def verify_task(user, task_id):
         flash("Bu vazifa yakunlangan!", "danger")
         return redirect(url_for("earn"))
 
+    if task["platform"] == "instagram":
+        if not user["cookie_consent"] or not user["ig_sessionid"]:
+            conn.close()
+            flash("Siz cookie tekshiruviga ruxsat bermagansiz! Avval 'Instagram & Cookie Ruxsati' bo'limidan ruxsat bering — aks holda vazifa tasdiqlanmaydi.", "danger")
+            return redirect(url_for("profile"))
+
     started = session.get("started_tasks", {})
     start_time = started.get(str(task_id))
     if not start_time:
         conn.close()
-        flash("Avval '1. Saytga o'tish' tugmasini bosib sahifaga kiring va obuna bo'ling!", "danger")
+        flash("Avval '1. Saytga o'tish' tugmasini bosib reklama beruvchi sahifasiga kiring va obuna bo'ling!", "danger")
         return redirect(url_for("earn"))
     if time.time() - start_time < 3:
         conn.close()
         flash("Juda tez tasdiqladingiz! Sahifaga o'tib obuna bo'ling (kamida 3-4 soniya).", "danger")
         return redirect(url_for("earn"))
 
-    if task["platform"] == "instagram" and user["ig_sessionid"]:
+    if task["platform"] == "instagram":
         target_ig = extract_ig_username(task["link"])
-        followed = check_instagram_follow(user["ig_sessionid"], target_ig)
-        if followed is False:
+        worker_ig = (user["ig_nick"] or extract_ig_username(user["ig_link"] or "")).lstrip("@").strip().lower()
+        found = search_worker_in_target_followers(user["ig_sessionid"], target_ig, worker_ig)
+        if found is False:
             conn.close()
-            flash(f"@{target_ig} sahifasiga hali obuna (Follow) bosilmagan! Avval obuna bo'ling.", "danger")
+            flash(f"@{target_ig} sahifasining obunachilari orasidan @{worker_ig or 'akkauntingiz'} topilmadi! Avval obuna bo'ling.", "danger")
             return redirect(url_for("earn"))
+        if found is None:
+            conn.close()
+            flash("Instagram obunachilarini tekshirib bo'lmadi (cookie eskirgan yoki Instagram vaqtinchalik chekladi). Cookie'ni yangilab qayta urinib ko'ring.", "danger")
+            return redirect(url_for("profile"))
 
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1560,7 +1591,7 @@ def verify_task(user, task_id):
         conn.commit()
         started.pop(str(task_id), None)
         session["started_tasks"] = started
-        flash(f"Vazifa tasdiqlandi! Balansingizga +{task['reward_per_action']} so'm qo'shildi!{bonus_msg}", "success")
+        flash(f"Obunachilar orasidan tasdiqlandi! Balansingizga +{task['reward_per_action']} so'm qo'shildi!{bonus_msg}", "success")
     except sqlite3.IntegrityError:
         conn.rollback()
         flash("Siz bu vazifani allaqachon bajargansiz!", "danger")
