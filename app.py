@@ -36,6 +36,8 @@ CONFIG = {
     "ADMIN_EMAIL": "maripjonovbahromjon@gmail.com",
     "SMTP_EMAIL": os.environ.get("SMTP_EMAIL", "maripjonovbahromjon@gmail.com"),
     "SMTP_APP_PASSWORD": os.environ.get("SMTP_APP_PASSWORD", ""),
+    "BREVO_API_KEY": os.environ.get("BREVO_API_KEY", ""),
+    "RESEND_API_KEY": os.environ.get("RESEND_API_KEY", ""),
     "GOOGLE_CLIENT_ID": os.environ.get("GOOGLE_CLIENT_ID", ""),
     "GOOGLE_CLIENT_SECRET": os.environ.get("GOOGLE_CLIENT_SECRET", ""),
     "DB_NAME": "topfollowfaster.db"
@@ -60,14 +62,15 @@ def generate_bio_code():
     return "TFF-" + "".join(random.choice(chars) for _ in range(6))
 
 def seed_initial_tasks(c, admin_id):
-    existing = c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    existing = c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'active'").fetchone()[0]
     if existing > 0:
         return
     sample_tasks = [
-        (admin_id, "instagram", "Instagram sahifaga obuna bo'ling (TopFollowFaster)", "https://www.instagram.com/instagram/", 100),
-        (admin_id, "youtube", "YouTube kanalga obuna bo'ling", "https://www.youtube.com/", 100),
-        (admin_id, "telegram_channel", "Telegram yangiliklar kanaliga a'zo bo'ling", "https://t.me/telegram", 100),
-        (admin_id, "telegram_group", "Telegram muhokama guruhiga qo'shiling", "https://t.me/telegram", 100),
+        (admin_id, "instagram", "Instagram rasmiy sahifaga obuna bo'ling", "https://www.instagram.com/instagram/", 500),
+        (admin_id, "instagram", "Bahromjon Instagram sahifasiga obuna bo'ling", "https://www.instagram.com/bahromjonmaripjonov/", 500),
+        (admin_id, "youtube", "YouTube kanalga obuna bo'ling", "https://www.youtube.com/", 500),
+        (admin_id, "telegram_channel", "Telegram yangiliklar kanaliga a'zo bo'ling", "https://t.me/telegram", 500),
+        (admin_id, "telegram_group", "Telegram muhokama guruhiga qo'shiling", "https://t.me/telegram", 500),
     ]
     for owner_id, platform, title, link, target_count in sample_tasks:
         c.execute("""
@@ -205,46 +208,105 @@ def allowed_receipt(filename):
     ext = filename.rsplit(".", 1)[1].lower()
     return ext in ALLOWED_RECEIPT_EXTS
 
-# ================= EMAIL VA INSTAGRAM BIO + FOLLOW TEKSHIRUV =================
-def send_reset_email(to_email, code):
-    smtp_email = CONFIG["SMTP_EMAIL"].strip()
-    smtp_pass = CONFIG["SMTP_APP_PASSWORD"].replace(" ", "").strip()
-    if not smtp_email or not smtp_pass:
-        return False, "SMTP_APP_PASSWORD Render Environment bo'limiga kiritilmagan!"
+# ================= GLOBAL XATO USHLAGICH (INTERNAL SERVER ERROR OLDINI OLISH) =================
+@app.errorhandler(Exception)
+def handle_unexpected_error(err):
+    flash(f"Tizim xatoligi: {str(err)}", "danger")
+    if "user_id" in session:
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
 
-    body = (
+# ================= EMAIL YUBORISH (HTTP API + SMTP) =================
+def send_reset_email(to_email, code):
+    subject = f"{CONFIG['SITE_NAME']} — Parolni tiklash kodi: {code}"
+    body_text = (
         f"Salom!\n\n"
         f"{CONFIG['SITE_NAME']} saytida parolni tiklash uchun tasdiqlash kodingiz: {code}\n"
         f"Kod 10 daqiqa davomida amal qiladi.\n\n"
         f"Agar siz so'rov yubormagan bo'lsangiz, bu xabarga e'tibor bermang."
     )
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = f"{CONFIG['SITE_NAME']} — Parolni tiklash kodi: {code}"
+
+    brevo_key = (os.environ.get("BREVO_API_KEY") or CONFIG["BREVO_API_KEY"] or "").strip()
+    sender_email = (os.environ.get("SMTP_EMAIL") or CONFIG["SMTP_EMAIL"] or "no-reply@example.com").strip()
+    if brevo_key:
+        try:
+            payload = json.dumps({
+                "sender": {"name": CONFIG["SITE_NAME"], "email": sender_email},
+                "to": [{"email": to_email}],
+                "subject": subject,
+                "textContent": body_text,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.brevo.com/v3/smtp/email",
+                data=payload,
+                headers={
+                    "accept": "application/json",
+                    "api-key": brevo_key,
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "Kod emailga yuborildi!"
+        except Exception as e:
+            return False, f"Brevo API xatosi: {e}"
+
+    resend_key = (os.environ.get("RESEND_API_KEY") or CONFIG["RESEND_API_KEY"] or "").strip()
+    if resend_key:
+        try:
+            from_addr = os.environ.get("RESEND_FROM", "onboarding@resend.dev").strip()
+            payload = json.dumps({
+                "from": from_addr,
+                "to": [to_email],
+                "subject": subject,
+                "text": body_text,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {resend_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if 200 <= resp.status < 300:
+                    return True, "Kod emailga yuborildi!"
+        except Exception as e:
+            return False, f"Resend API xatosi: {e}"
+
+    smtp_email = (os.environ.get("SMTP_EMAIL") or CONFIG["SMTP_EMAIL"] or "").strip()
+    smtp_pass = (os.environ.get("SMTP_APP_PASSWORD") or CONFIG["SMTP_APP_PASSWORD"] or "").replace(" ", "").strip()
+    if not smtp_email or not smtp_pass:
+        return False, "BREVO_API_KEY yoki SMTP_APP_PASSWORD sozlanmagan."
+
+    msg = MIMEText(body_text, "plain", "utf-8")
+    msg["Subject"] = subject
     msg["From"] = smtp_email
     msg["To"] = to_email
 
-    last_err = ""
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(smtp_email, smtp_pass)
-            server.sendmail(smtp_email, [to_email], msg.as_string())
-        return True, "Kod emailga yuborildi!"
-    except Exception as e:
-        last_err = str(e)
+    for port in (587, 465):
+        try:
+            if port == 587:
+                with smtplib.SMTP("smtp.gmail.com", 587, timeout=7) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                    server.login(smtp_email, smtp_pass)
+                    server.sendmail(smtp_email, [to_email], msg.as_string())
+            else:
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=7) as server:
+                    server.login(smtp_email, smtp_pass)
+                    server.sendmail(smtp_email, [to_email], msg.as_string())
+            return True, "Kod emailga yuborildi!"
+        except Exception:
+            continue
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-            server.login(smtp_email, smtp_pass)
-            server.sendmail(smtp_email, [to_email], msg.as_string())
-        return True, "Kod emailga yuborildi!"
-    except Exception as e:
-        last_err = str(e)
+    return False, "Render Free tarifida SMTP portlar bloklangan. Render Environment'ga BREVO_API_KEY qo'shing."
 
-    return False, f"Email yuborishda xatolik: {last_err}"
-
+# ================= INSTAGRAM BIO + FOLLOW TEKSHIRUV =================
 def fetch_instagram_profile_info(ig_username):
     clean_user = ig_username.lstrip("@").strip().lower()
     if not clean_user:
@@ -257,7 +319,7 @@ def fetch_instagram_profile_info(ig_username):
     try:
         api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(clean_user)}"
         req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         u = (data.get("data") or {}).get("user")
         if u:
@@ -275,7 +337,7 @@ def fetch_instagram_profile_info(ig_username):
             "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         })
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
         bio_match = re.search(r'"biography"\s*:\s*"((?:\\.|[^"\\])*)"', html)
         if bio_match:
@@ -382,7 +444,7 @@ def get_receipt_file(user, filename):
         return "Ruxsat berilmagan", 403
     return send_from_directory(RECEIPT_UPLOAD_DIR, safe_name)
 
-# ================= MUKAMMAL ZAMONAVIY HTML SHABLON =================
+# ================= ZAMONAVIY HTML SHABLON =================
 BASE_HTML = """
 <!DOCTYPE html>
 <html lang="uz">
