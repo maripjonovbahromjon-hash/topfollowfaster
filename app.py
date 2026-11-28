@@ -96,8 +96,6 @@ def init_db():
             ref_bonus_paid INTEGER DEFAULT 0,
             ig_nick TEXT DEFAULT '',
             ig_link TEXT DEFAULT '',
-            ig_sessionid TEXT DEFAULT '',
-            cookie_consent INTEGER DEFAULT 0,
             yt_nick TEXT DEFAULT '',
             tg_nick TEXT DEFAULT '',
             reset_code TEXT DEFAULT '',
@@ -210,55 +208,22 @@ def to_web_url(raw_url):
         return u
     return "https://" + u.lstrip("/")
 
-def extract_ig_username(link):
-    parsed = urllib.parse.urlparse((link or "").strip())
-    parts = [p for p in parsed.path.split("/") if p]
-    if not parts or parts[0].lower() in ("p", "reel", "reels", "stories", "explore"):
-        return ""
-    return parts[0].lstrip("@").strip().lower()
-
-def search_worker_in_target_followers(sessionid, target_username, worker_username):
-    clean_target = (target_username or "").lstrip("@").strip().lower()
-    clean_worker = (worker_username or "").lstrip("@").strip().lower()
-    if not sessionid or not clean_target:
-        return None
-    try:
-        url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(clean_target)}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36",
-                "X-IG-App-ID": "936619743392459",
-                "Cookie": f"sessionid={sessionid.strip()};",
-                "Accept": "application/json",
-            }
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        user_obj = (data.get("data") or {}).get("user") or {}
-        if not user_obj:
-            return None
-        target_id = str(user_obj.get("id") or "")
-        followed = bool(user_obj.get("followed_by_viewer") or user_obj.get("requested_by_viewer"))
-        if target_id and clean_worker:
-            f_url = f"https://www.instagram.com/api/v1/friendships/{urllib.parse.quote(target_id)}/followers/?count=50"
-            f_req = urllib.request.Request(
-                f_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36",
-                    "X-IG-App-ID": "936619743392459",
-                    "Cookie": f"sessionid={sessionid.strip()};",
-                    "Accept": "application/json",
-                }
+def verify_account_exists(platform, account_handle):
+    clean = (account_handle or "").lstrip("@").strip().lower()
+    if not clean:
+        return False
+    if platform == "instagram":
+        try:
+            url = f"https://www.instagram.com/{urllib.parse.quote(clean)}/"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36"}
             )
-            with urllib.request.urlopen(f_req, timeout=10) as f_resp:
-                fdata = json.loads(f_resp.read().decode("utf-8"))
-            for u in (fdata.get("users") or []):
-                if (u.get("username") or "").strip().lower() == clean_worker:
-                    return True
-        return True if followed else False
-    except Exception:
-        return None
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return resp.status == 200
+        except Exception:
+            return True
+    return True
 
 def send_reset_email(to_email, code):
     subject = f"{CONFIG['SITE_NAME']} — Parolni tiklash kodi: {code}"
@@ -369,7 +334,7 @@ BASE_HTML = """
                 <a href="{{ url_for('earn') }}">Pul ishlash (+{{ config.WORKER_REWARD }})</a>
                 <a href="{{ url_for('advertise') }}">Buyurtma ({{ config.ADVERTISER_PRICE }})</a>
                 <a href="{{ url_for('wallet') }}">Hamyon</a>
-                <a href="{{ url_for('profile') }}">Instagram Silkasi</a>
+                <a href="{{ url_for('profile') }}">Akkaunt</a>
                 {% if show_admin %}<a href="{{ url_for('admin_panel') }}">Admin</a>{% endif %}
                 <a href="{{ url_for('logout') }}" style="color:#f87171;">Chiqish</a>
             {% else %}
@@ -579,15 +544,15 @@ def profile(user):
         )
         conn.commit()
         conn.close()
-        flash("Instagram silkasi saqlandi!", "success")
+        flash("Instagram akkaunt ma'lumoti saqlandi!", "success")
         return redirect(url_for("profile"))
 
     return render_page("""
         <div class="card">
-            <h2>Instagram Silkasi</h2>
-            <p style="color:#94a3b8;">Instagram silkangizni kiriting. Cookie vazifani bosib tasdiqlash paytida so'raladi.</p>
+            <h2>Instagram Akkaunt</h2>
+            <p style="color:#94a3b8;">Vazifalarni tekshirish uchun foydalanadigan Instagram username yoki havolangizni kiriting.</p>
             <form method="POST">
-                <label>Sizning Instagram silkangiz</label>
+                <label>Instagram username yoki havola</label>
                 <input type="text" name="ig_link" value="{{ user.ig_link or user.ig_nick }}" placeholder="https://www.instagram.com/username/">
                 <button class="btn btn-success">Saqlash</button>
             </form>
@@ -650,41 +615,24 @@ def consent_verify(user, task_id):
         return redirect(url_for("earn"))
 
     if request.method == "POST":
-        decision = request.form.get("decision", "")
-        if decision == "deny":
-            conn.execute("UPDATE users SET cookie_consent=0 WHERE id=?", (user["id"],))
-            conn.commit()
-            conn.close()
-            flash("Cookie ruxsati berilmadi — vazifa tasdiqlanmadi!", "danger")
-            return redirect(url_for("earn"))
-
         raw_ig = request.form.get("ig_link", "").strip() or (user["ig_link"] or user["ig_nick"] or "")
-        ig_sessionid = request.form.get("ig_sessionid", "").strip() or (user["ig_sessionid"] or "")
         nick, full_link = parse_ig_link_or_nick(raw_ig)
 
         if not nick:
             conn.close()
-            flash("Obunachilar orasidan qidirish uchun Instagram silkangiz yoki username'ingizni kiriting!", "danger")
-            return redirect(url_for("consent_verify", task_id=task_id))
-
-        if not ig_sessionid:
-            conn.close()
-            flash("Ruxsat berish uchun Instagram sessionid cookie qiymatini kiriting!", "danger")
+            flash("Tasdiqlash uchun Instagram username yoki havolangizni kiriting!", "danger")
             return redirect(url_for("consent_verify", task_id=task_id))
 
         conn.execute(
-            "UPDATE users SET cookie_consent=1, ig_sessionid=?, ig_link=?, ig_nick=? WHERE id=?",
-            (ig_sessionid, full_link, "@" + nick, user["id"])
+            "UPDATE users SET ig_link=?, ig_nick=? WHERE id=?",
+            (full_link, "@" + nick, user["id"])
         )
         conn.commit()
 
-        if task["platform"] == "instagram":
-            target_ig = extract_ig_username(task["link"])
-            found = search_worker_in_target_followers(ig_sessionid, target_ig, nick)
-            if found is not True:
-                conn.close()
-                flash("Obunachilar orasidan tasdiqlanmadi yoki sessionid tekshiruvdan o'tmadi!", "danger")
-                return redirect(url_for("earn"))
+        if not verify_account_exists(task["platform"], nick):
+            conn.close()
+            flash("Akkaunt tekshiruvdan o'tmadi!", "danger")
+            return redirect(url_for("earn"))
 
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -704,20 +652,15 @@ def consent_verify(user, task_id):
     conn.close()
     return render_page("""
         <div class="card" style="max-width:480px; margin:0 auto;">
-            <h2>Cookie Ruxsati va Tasdiqlash</h2>
+            <h2>Akkaunt Orqali Tasdiqlash</h2>
             <p style="color:#94a3b8;">
                 Vazifa: <b>{{ task.title }}</b><br>
-                Instagram sahifasiga kirib obuna bosgan bo'lsangiz, tekshiruv uchun cookie ruxsati bering. Ruxsat bermasangiz tasdiqlanmaydi.
+                Sahifaga obuna bo‘lgan akkauntingiz username yoki havolasini ko‘rsating.
             </p>
             <form method="POST">
-                <label>Sizning Instagram silkangiz (yoki username)</label>
+                <label>Sizning Instagram username yoki havolangiz</label>
                 <input type="text" name="ig_link" value="{{ user.ig_link or user.ig_nick }}" required placeholder="https://www.instagram.com/username/">
-
-                <label>Instagram sessionid cookie</label>
-                <input type="text" name="ig_sessionid" value="{{ user.ig_sessionid }}" required placeholder="sessionid qiymati">
-
-                <button name="decision" value="allow" class="btn btn-success" style="width:100%; margin-bottom:8px;">Ruxsat beraman va tekshirish</button>
-                <button name="decision" value="deny" class="btn btn-danger" style="width:100%;">Ruxsat bermayman</button>
+                <button class="btn btn-success" style="width:100%;">Tasdiqlash</button>
             </form>
         </div>
     """, user=user, task=task)
